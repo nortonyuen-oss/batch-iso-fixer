@@ -7,10 +7,14 @@ It can:
 - remove white / single-color / corner-detected background
 - export transparent PNG
 - crop transparent borders
+- remove white matte / defringe semi-transparent edges
+- bleed visible edge colors into transparent pixels to prevent GPU sampling halos
+- resize RGBA with premultiplied-alpha math
 - apply global `scale_x` and `scale_y`
 - place processed assets on a fixed transparent canvas
 - align center or bottom-center
 - batch export with CSV log
+- recursively process a whole raw asset folder while preserving subfolders
 - preview before / after
 - optionally attempt OpenCV base-angle analysis
 - measure output silhouette left/right isometric Y/X ratio against the target 0.5
@@ -86,6 +90,31 @@ Settings are saved to:
 output/fixed/settings.json
 ```
 
+## Recursive raw folder workflow
+
+For a full model folder with nested categories, put the source tree under:
+
+```text
+input/raw/
+```
+
+Then use **Recursive Raw Folder Export** and click **Process raw folder tree**.
+Processed PNGs will be written under:
+
+```text
+output/modified/
+```
+
+The subfolder structure is preserved. For example:
+
+```text
+input/raw/government/4x4/university4-01.png
+-> output/modified/government/4x4/university4-01.png
+```
+
+Non-PNG inputs are also exported as `.png` because the processing pipeline writes
+transparent RGBA assets.
+
 ## Suggested settings for Norton's isometric assets
 
 For AI-generated white background assets:
@@ -94,6 +123,8 @@ For AI-generated white background assets:
 Background mode: auto_corner or white
 Tolerance: 20–35
 Feather alpha edges: on
+Remove white matte / defringe: on
+RGB bleed pixels: 2–4
 Crop transparent border: on
 Crop padding: 20
 Scale X: 1.00
@@ -102,6 +133,33 @@ Canvas: 1024 x 1024
 Alignment: bottom-center
 Bottom margin: 40
 ```
+
+## Avoiding white halos in game
+
+White jagged edges usually come from RGB data around transparent pixels, not
+only from the alpha channel. If a PNG has semi-transparent white pixels on the
+building outline, or fully transparent pixels whose hidden RGB is white, game
+scaling/filtering can sample that white and show a halo.
+
+This tool now processes assets in this order:
+
+```text
+source image
+-> remove background / alpha mask
+-> remove white matte from semi-transparent edges
+-> bleed visible edge RGB into transparent pixels
+-> crop
+-> premultiplied-alpha resize
+-> bleed RGB again
+-> place on final transparent canvas
+-> bleed RGB again
+-> PNG
+```
+
+Use the **Halo debug backgrounds** preview to check the output on dark, green,
+and gray backgrounds before exporting a full batch. If the edge still looks too
+bright, try `RGB bleed pixels: 3` or `4`; if tiny details start to smear, lower
+it back to `2`.
 
 ## Notes
 

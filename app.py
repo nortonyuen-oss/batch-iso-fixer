@@ -10,9 +10,11 @@ from PIL import Image
 from image_processor import (
     ProcessingSettings,
     list_images,
+    list_images_recursive,
     load_image,
     process_image,
     process_batch,
+    process_recursive_batch,
     make_before_after,
     remove_background,
     crop_transparent,
@@ -25,6 +27,14 @@ st.set_page_config(page_title="Batch Isometric Asset Fixer", layout="wide")
 st.title("Batch Isometric Asset Fixer")
 st.caption("批量去背、裁切、X/Y比例修正、透明 PNG 輸出。適合 isometric building / tile assets。")
 
+
+def composite_on_color(image: Image.Image, color: tuple[int, int, int]) -> Image.Image:
+    img = image.convert("RGBA")
+    bg = Image.new("RGBA", img.size, (*color, 255))
+    bg.alpha_composite(img, (0, 0))
+    return bg.convert("RGB")
+
+
 if "settings" not in st.session_state:
     st.session_state.settings = ProcessingSettings()
 
@@ -34,6 +44,8 @@ with st.sidebar:
     st.header("Folders")
     input_folder = st.text_input("Input folder", value="input")
     output_folder = st.text_input("Output folder", value="output/fixed")
+    raw_input_folder = st.text_input("Raw tree input", value="input/raw")
+    modified_output_folder = st.text_input("Modified tree output", value="output/modified")
 
     st.divider()
     st.header("Background")
@@ -55,6 +67,21 @@ with st.sidebar:
         settings.feather_edges = st.checkbox("Feather alpha edges", value=settings.feather_edges)
         if settings.feather_edges:
             settings.feather_radius = st.slider("Feather radius", 0.0, 3.0, float(settings.feather_radius), 0.1)
+
+    st.divider()
+    st.header("Anti-halo")
+    settings.defringe_edges = st.checkbox(
+        "Remove white matte / defringe",
+        value=settings.defringe_edges,
+        help="修正半透明邊緣入面殘留嘅白色 RGB，減少遊戲內白邊。",
+    )
+    settings.edge_bleed_pixels = st.slider(
+        "RGB bleed pixels",
+        0,
+        8,
+        int(settings.edge_bleed_pixels),
+        help="將可見像素顏色向透明區擴展，避免 GPU/縮放 sample 到白色透明像素。",
+    )
 
     st.divider()
     st.header("Crop / Scale")
@@ -113,6 +140,9 @@ st.session_state.settings = settings
 input_path = Path(input_folder).expanduser()
 output_path = Path(output_folder).expanduser()
 images = list_images(input_path)
+raw_input_path = Path(raw_input_folder).expanduser()
+modified_output_path = Path(modified_output_folder).expanduser()
+raw_images = list_images_recursive(raw_input_path)
 
 col_a, col_b, col_c, col_d = st.columns(4)
 col_a.metric("Images found", len(images))
@@ -144,6 +174,12 @@ else:
             c2.image(after, caption="After", use_container_width=True)
             combined = make_before_after(before, after)
             c3.image(combined, caption="Before / After", use_container_width=True)
+
+            with st.expander("Halo debug backgrounds", expanded=False):
+                bg1, bg2, bg3 = st.columns(3)
+                bg1.image(composite_on_color(after, (20, 20, 20)), caption="Dark", use_container_width=True)
+                bg2.image(composite_on_color(after, (70, 170, 65)), caption="Game green", use_container_width=True)
+                bg3.image(composite_on_color(after, (120, 120, 120)), caption="Road gray", use_container_width=True)
 
             if analyze_angle:
                 if settings.skip_background_removal:
@@ -182,6 +218,39 @@ else:
             st.download_button("Download exported settings.json", data=settings_path.read_bytes(), file_name="settings.json", mime="application/json")
 
 st.divider()
+st.subheader("Recursive Raw Folder Export")
+st.caption("一按處理 `input/raw/` 內所有子資料夾圖片，並喺 `output/modified/` 重現相同資料夾結構。")
+
+rc1, rc2, rc3 = st.columns(3)
+rc1.metric("Raw tree images", len(raw_images))
+rc2.write(f"Input: `{raw_input_path.resolve()}`")
+rc3.write(f"Output: `{modified_output_path.resolve()}`")
+
+if not raw_input_path.exists():
+    st.warning(f"Raw input folder does not exist yet: {raw_input_path.resolve()}")
+elif not raw_images:
+    st.warning("No recursive images found in raw input folder.")
+else:
+    with st.expander("Show raw tree files", expanded=False):
+        st.write([p.relative_to(raw_input_path).as_posix() for p in raw_images])
+
+    if st.button("Process raw folder tree", type="primary"):
+        with st.spinner("Processing full raw folder tree..."):
+            results = process_recursive_batch(raw_input_path, modified_output_path, settings, analyze_angle=False)
+        df = pd.DataFrame([r.__dict__ for r in results])
+        success = int((df["status"] == "success").sum()) if not df.empty else 0
+        failed = len(df) - success
+        st.success(f"Done. Success: {success}, Failed: {failed}")
+        st.dataframe(df, use_container_width=True)
+
+        log_path = modified_output_path / "process_log.csv"
+        settings_path = modified_output_path / "settings.json"
+        if log_path.exists():
+            st.download_button("Download recursive process_log.csv", data=log_path.read_bytes(), file_name="process_log.csv", mime="text/csv")
+        if settings_path.exists():
+            st.download_button("Download recursive settings.json", data=settings_path.read_bytes(), file_name="settings.json", mime="application/json")
+
+st.divider()
 st.subheader("One-off Upload Test")
 st.caption("未想整理 folder 時，可以先拖一張圖入嚟試效果。")
 uploaded = st.file_uploader("Upload single image", type=["png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff"])
@@ -191,6 +260,12 @@ if uploaded is not None:
     cc1, cc2 = st.columns(2)
     cc1.image(img, caption="Uploaded", use_container_width=True)
     cc2.image(after, caption="Processed", use_container_width=True)
+
+    with st.expander("Halo debug backgrounds", expanded=True):
+        bg1, bg2, bg3 = st.columns(3)
+        bg1.image(composite_on_color(after, (20, 20, 20)), caption="Dark", use_container_width=True)
+        bg2.image(composite_on_color(after, (70, 170, 65)), caption="Game green", use_container_width=True)
+        bg3.image(composite_on_color(after, (120, 120, 120)), caption="Road gray", use_container_width=True)
 
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
         after.save(tmp.name)
