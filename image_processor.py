@@ -329,6 +329,39 @@ def _median_extreme_point(xs: np.ndarray, ys: np.ndarray, axis: str, value: int)
     raise ValueError(f"Unknown axis: {axis}")
 
 
+def _find_side_corners(
+    xs: np.ndarray,
+    ys: np.ndarray,
+) -> tuple[tuple[int, int], tuple[int, int]]:
+    """Find left and right isometric corner reference points via smoothed edge profiles.
+
+    For each row, the rightmost and leftmost pixel positions are recorded.  Both
+    profiles are smoothed over ~5 % of the silhouette height so that narrow
+    single-row protrusions (fence pillars, gate posts, etc.) do not dominate the
+    peak/trough and shift the measured corner away from the true building edge.
+    """
+    unique_ys, inverse = np.unique(ys, return_inverse=True)
+    n = len(unique_ys)
+
+    row_max_x = np.zeros(n, dtype=np.int64)
+    row_min_x = np.full(n, int(xs.max()), dtype=np.int64)
+    np.maximum.at(row_max_x, inverse, xs)
+    np.minimum.at(row_min_x, inverse, xs)
+
+    smooth_w = max(5, int(n * 0.05))
+    kernel = np.ones(smooth_w) / smooth_w
+    smoothed_max = np.convolve(row_max_x.astype(float), kernel, mode="same")
+    smoothed_min = np.convolve(row_min_x.astype(float), kernel, mode="same")
+
+    right_idx = int(np.argmax(smoothed_max))
+    left_idx = int(np.argmin(smoothed_min))
+
+    return (
+        (int(row_min_x[left_idx]), int(unique_ys[left_idx])),
+        (int(row_max_x[right_idx]), int(unique_ys[right_idx])),
+    )
+
+
 def _line_from_points(points: np.ndarray) -> Optional[tuple[float, float]]:
     if len(points) < 8:
         return None
@@ -475,8 +508,7 @@ def measure_isometric_ratios(
             "iso_bottom_point": "",
         }
 
-    left = _median_extreme_point(xs, ys, "x", int(xs.min()))
-    right = _median_extreme_point(xs, ys, "x", int(xs.max()))
+    left, right = _find_side_corners(xs, ys)
 
     # Determine per-side bottom anchors using solid-pixel filtering.
     corners = _find_bottom_corners(alpha_raw, solid_alpha_threshold=200, y_tolerance=2)
