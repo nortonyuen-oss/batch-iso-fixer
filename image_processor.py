@@ -485,14 +485,13 @@ def measure_isometric_ratios(
 ) -> dict[str, Optional[float] | str]:
     """Measure output alpha silhouette against a 1:2 isometric y/x ratio.
 
-    Slopes are measured from the upper silhouette outlines (equator row and above)
-    so that base decorations — fences, gardens, road surfaces, cars — cannot
-    interfere with the measurement regardless of building type.
+    Right and left reference points are found by scanning from the bottom at an
+    x position inset 10 % from each extreme edge.  This keeps the reference on
+    the main building wall and away from narrow decoration protrusions (fence
+    pillars, gate posts, etc.) that sit at the very edge of the silhouette.
 
-    The equator row (widest smoothed horizontal span) is found by _find_side_corners.
-    Per-row right-edge and left-edge profiles above that row are fitted with
-    _fit_lower_edge, which focuses on the lowest (wall-like) part of each profile
-    and discards roof decorations as outliers.
+    The bottom anchor is either the virtual bottom corner (extrapolated tip) when
+    use_virtual_bottom_corner is True, or the physical bottommost pixel median.
     """
     alpha_raw = np.array(image.convert("RGBA").getchannel("A"))
     alpha = alpha_raw > int(alpha_threshold)
@@ -511,54 +510,56 @@ def measure_isometric_ratios(
             "iso_bottom_point": "",
         }
 
-    left, right = _find_side_corners(xs, ys)
-    # Equator y: use the lower of the two corner rows so the upper window is
-    # guaranteed to contain both corner positions.
-    equator_y = max(left[1], right[1])
+    x_min, x_max = int(xs.min()), int(xs.max())
+    width = max(1, x_max - x_min)
+    # 10 % inset from each edge; search band = 1 % of width (min 3 px)
+    inset = int(round(width * 0.10))
+    band = max(3, int(round(width * 0.01)))
 
-    # Build per-row right-edge and left-edge profiles (vectorised).
-    unique_ys, inverse = np.unique(ys, return_inverse=True)
-    n_rows = len(unique_ys)
-    row_max_x = np.zeros(n_rows, dtype=np.int64)
-    row_min_x = np.full(n_rows, int(xs.max()), dtype=np.int64)
-    np.maximum.at(row_max_x, inverse, xs)
-    np.minimum.at(row_min_x, inverse, xs)
+    def lowest_near_x(ref_x: int) -> tuple[int, int]:
+        """Return the bottommost pixel within ±band of ref_x."""
+        for radius in (band, band * 5, band * 15):
+            mask = (xs >= ref_x - radius) & (xs <= ref_x + radius)
+            if np.any(mask):
+                idx = int(np.argmax(ys[mask]))
+                return int(xs[mask][idx]), int(ys[mask][idx])
+        return _median_extreme_point(xs, ys, "x", x_max if ref_x > (x_min + x_max) // 2 else x_min)
 
-    # Restrict to rows at or above the equator — the base-decoration-free zone.
-    upper_mask = unique_ys <= equator_y
-    upper_ys = unique_ys[upper_mask]
-    upper_max_x = row_max_x[upper_mask]
-    upper_min_x = row_min_x[upper_mask]
+    right = lowest_near_x(x_max - inset)
+    left = lowest_near_x(x_min + inset)
 
-    # Stack into (x, y) point arrays expected by _fit_lower_edge.
-    # _fit_lower_edge takes the lower (high-y) portion of the supplied points,
-    # which corresponds to the clean wall zone just above the equator.
-    right_outline = np.stack([upper_max_x, upper_ys], axis=1).astype(np.int32)
-    left_outline = np.stack([upper_min_x, upper_ys], axis=1).astype(np.int32)
+    bottom = _median_extreme_point(xs, ys, "y", int(ys.max()))
+    method = "bottom-scan-10pct"
+    if use_virtual_bottom_corner:
+        virtual = _virtual_bottom_point(alpha)
+        if virtual is not None:
+            bottom = virtual
+            method = "bottom-scan-10pct+virtual"
 
-    right_line = _fit_lower_edge(right_outline, expected_slope_sign=1)
-    left_line = _fit_lower_edge(left_outline, expected_slope_sign=-1)
+    def ratio(point: tuple[int, int], btm: tuple[int, int]) -> Optional[float]:
+        dx = point[0] - btm[0]
+        if dx == 0:
+            return None
+        return round((point[1] - btm[1]) / dx, 4)
 
-    right_slope = right_line[0] if right_line is not None else None
-    left_slope = left_line[0] if left_line is not None else None
-
-    right_abs = round(abs(right_slope), 4) if right_slope is not None else None
-    left_abs = round(abs(left_slope), 4) if left_slope is not None else None
+    right_ratio = ratio(right, bottom)
+    left_ratio = ratio(left, bottom)
+    right_abs = round(abs(right_ratio), 4) if right_ratio is not None else None
+    left_abs = round(abs(left_ratio), 4) if left_ratio is not None else None
     avg_ratio = round((right_abs + left_abs) / 2, 4) if right_abs is not None and left_abs is not None else None
     side_diff = round(abs(right_abs - left_abs), 4) if right_abs is not None and left_abs is not None else None
 
-    equator_cx = (left[0] + right[0]) // 2
     return {
-        "iso_right_ratio": round(right_slope, 4) if right_slope is not None else None,
-        "iso_left_ratio": round(left_slope, 4) if left_slope is not None else None,
+        "iso_right_ratio": right_ratio,
+        "iso_left_ratio": left_ratio,
         "iso_right_abs_ratio": right_abs,
         "iso_left_abs_ratio": left_abs,
         "iso_avg_ratio": avg_ratio,
         "iso_side_diff": side_diff,
-        "iso_measurement_method": "upper-edge-fit",
+        "iso_measurement_method": method,
         "iso_right_point": f"({right[0]},{right[1]})",
         "iso_left_point": f"({left[0]},{left[1]})",
-        "iso_bottom_point": f"eq({equator_cx},{equator_y})",
+        "iso_bottom_point": f"({bottom[0]},{bottom[1]})",
     }
 
 
