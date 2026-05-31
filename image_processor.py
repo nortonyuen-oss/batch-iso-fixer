@@ -11,7 +11,7 @@ import numpy as np
 from PIL import Image, ImageChops
 
 try:
-    import cv2  # optional, used for angle analysis only
+    import cv2  # used for flood-fill background removal and angle analysis
 except Exception:  # pragma: no cover
     cv2 = None
 
@@ -25,6 +25,7 @@ SUPPORTED_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff
 
 @dataclass
 class ProcessingSettings:
+    skip_background_removal: bool = False
     background_mode: BackgroundMode = "auto_corner"
     tolerance: int = 25
     custom_bg_hex: str = "#ffffff"
@@ -133,6 +134,46 @@ def estimate_corner_background(image: Image.Image, sample_size: int = 12) -> tup
     return tuple(int(x) for x in rgb)
 
 
+def _outer_background_mask(candidate_mask: np.ndarray, connectivity: int = 4) -> np.ndarray:
+    """Return only background pixels that are connected to the image border.
+
+    Uses connected-components on the candidate mask with a padded border so that
+    all edge-touching background regions are found in one pass.  Interior white
+    areas that are fully surrounded by the subject are NOT included.
+    """
+    if cv2 is not None:
+        mask_uint8 = candidate_mask.astype(np.uint8) * 255
+        # One-pixel border of "background" ensures connectivity from every edge pixel.
+        padded = cv2.copyMakeBorder(mask_uint8, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=255)
+        _, labels = cv2.connectedComponents(padded, connectivity=connectivity)
+        outer_label = int(labels[0, 0])  # always part of the padded border
+        return (labels[1:-1, 1:-1] == outer_label)
+
+    # Fallback: BFS from border pixels when cv2 is unavailable
+    from collections import deque
+    h, w = candidate_mask.shape
+    visited = np.zeros_like(candidate_mask, dtype=bool)
+    queue: deque = deque()
+    for y in range(h):
+        for x in (0, w - 1):
+            if candidate_mask[y, x] and not visited[y, x]:
+                visited[y, x] = True
+                queue.append((y, x))
+    for x in range(w):
+        for y in (0, h - 1):
+            if candidate_mask[y, x] and not visited[y, x]:
+                visited[y, x] = True
+                queue.append((y, x))
+    while queue:
+        cy, cx = queue.popleft()
+        for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            ny, nx = cy + dy, cx + dx
+            if 0 <= ny < h and 0 <= nx < w and not visited[ny, nx] and candidate_mask[ny, nx]:
+                visited[ny, nx] = True
+                queue.append((ny, nx))
+    return visited
+
+
 def remove_background(
     image: Image.Image,
     mode: BackgroundMode = "auto_corner",
@@ -157,16 +198,24 @@ def remove_background(
 
     # tolerance is user-friendly; RGB euclidean distance needs a wider internal threshold
     threshold = max(1, int(tolerance)) * 1.8
-    mask = distance <= threshold
-    alpha[mask] = 0
 
-    # Keep semi-transparent edge transition instead of jagged hard cut
+    # Only remove background pixels reachable from the image border (flood fill).
+    # This prevents interior white areas of the subject from becoming transparent.
+    candidate_bg = distance <= threshold
+    outer_bg = _outer_background_mask(candidate_bg)
+    alpha[outer_bg] = 0
+
+    # Keep semi-transparent edge transition instead of jagged hard cut.
+    # Extend the flood-fill region to cover the soft feathering zone as well.
     if feather_edges and tolerance > 0:
         soft_threshold = threshold * 1.7
-        soft_zone = (distance > threshold) & (distance <= soft_threshold)
-        if np.any(soft_zone):
-            ramp = (distance[soft_zone] - threshold) / max(1, soft_threshold - threshold)
-            alpha[soft_zone] = np.minimum(alpha[soft_zone], (ramp * 255).astype(np.uint8))
+        soft_zone_candidates = (distance > threshold) & (distance <= soft_threshold)
+        if np.any(soft_zone_candidates):
+            outer_soft = _outer_background_mask(candidate_bg | soft_zone_candidates)
+            actual_soft = outer_soft & soft_zone_candidates & ~outer_bg
+            if np.any(actual_soft):
+                ramp = (distance[actual_soft] - threshold) / max(1, soft_threshold - threshold)
+                alpha[actual_soft] = np.minimum(alpha[actual_soft], (ramp * 255).astype(np.uint8))
 
     out = np.array(img)
     out[..., 3] = alpha
@@ -238,14 +287,17 @@ def place_on_canvas(
 
 
 def process_image(image: Image.Image, settings: ProcessingSettings) -> Image.Image:
-    out = remove_background(
-        image,
-        mode=settings.background_mode,
-        tolerance=settings.tolerance,
-        custom_bg_hex=settings.custom_bg_hex,
-        feather_edges=settings.feather_edges,
-        feather_radius=settings.feather_radius,
-    )
+    if settings.skip_background_removal:
+        out = image.convert("RGBA")
+    else:
+        out = remove_background(
+            image,
+            mode=settings.background_mode,
+            tolerance=settings.tolerance,
+            custom_bg_hex=settings.custom_bg_hex,
+            feather_edges=settings.feather_edges,
+            feather_radius=settings.feather_radius,
+        )
     if settings.crop_transparent:
         out = crop_transparent(out, settings.crop_padding)
     out = scale_image(out, settings.scale_x, settings.scale_y)
@@ -315,6 +367,32 @@ def _fit_lower_edge(points: np.ndarray, expected_slope_sign: int) -> Optional[tu
     return slope, intercept
 
 
+def _find_bottom_corners(
+    alpha_raw: np.ndarray,
+    solid_alpha_threshold: int = 200,
+    y_tolerance: int = 2,
+) -> Optional[tuple[tuple[int, int], tuple[int, int]]]:
+    """Return (left_bottom, right_bottom) anchor points for isometric slope measurement.
+
+    Applies solid_alpha_threshold first to exclude semi-transparent edge pixels, then
+    collects all solid pixels within y_tolerance rows of the bottommost solid pixel.
+    The leftmost and rightmost of those pixels become the two bottom anchors.
+    """
+    solid = alpha_raw >= solid_alpha_threshold
+    ys, xs = np.nonzero(solid)
+    if len(xs) == 0:
+        return None
+    max_y = int(ys.max())
+    row_indices = np.arange(alpha_raw.shape[0])
+    band_mask = solid & (row_indices[:, None] >= max_y - y_tolerance)
+    band_ys, band_xs = np.nonzero(band_mask)
+    if len(band_xs) == 0:
+        return None
+    left_idx = int(np.argmin(band_xs))
+    right_idx = int(np.argmax(band_xs))
+    return (int(band_xs[left_idx]), int(band_ys[left_idx])), (int(band_xs[right_idx]), int(band_ys[right_idx]))
+
+
 def _virtual_bottom_point(alpha: np.ndarray) -> Optional[tuple[int, int]]:
     ys, xs = np.nonzero(alpha)
     if len(xs) == 0:
@@ -374,12 +452,14 @@ def measure_isometric_ratios(
 ) -> dict[str, Optional[float] | str]:
     """Measure output alpha silhouette against a 1:2 isometric y/x ratio.
 
-    The measurement uses the non-transparent leftmost, rightmost, and bottommost
-    silhouette points. When an extreme contains multiple pixels, the median point
-    along that extreme is used so a flat edge or antialiasing does not pick a
-    random corner pixel.
+    Uses separate left-bottom and right-bottom anchor points so that flat-bottomed
+    isometric shapes (e.g. large sports fields) produce accurate per-side slopes.
+    For pointed-tip shapes the two anchors converge to the same point, preserving
+    the original behaviour.  Virtual-bottom extrapolation is only applied when the
+    two anchors are nearly coincident (pointed or near-pointed tips).
     """
-    alpha = np.array(image.convert("RGBA").getchannel("A")) > int(alpha_threshold)
+    alpha_raw = np.array(image.convert("RGBA").getchannel("A"))
+    alpha = alpha_raw > int(alpha_threshold)
     ys, xs = np.nonzero(alpha)
     if len(xs) == 0:
         return {
@@ -397,26 +477,46 @@ def measure_isometric_ratios(
 
     left = _median_extreme_point(xs, ys, "x", int(xs.min()))
     right = _median_extreme_point(xs, ys, "x", int(xs.max()))
-    bottom = _median_extreme_point(xs, ys, "y", int(ys.max()))
-    method = "physical-bottom"
-    if use_virtual_bottom_corner:
-        virtual_bottom = _virtual_bottom_point(alpha)
-        if virtual_bottom is not None:
-            bottom = virtual_bottom
+
+    # Determine per-side bottom anchors using solid-pixel filtering.
+    corners = _find_bottom_corners(alpha_raw, solid_alpha_threshold=200, y_tolerance=2)
+    if corners is not None:
+        left_bottom, right_bottom = corners
+    else:
+        single = _median_extreme_point(xs, ys, "y", int(ys.max()))
+        left_bottom = right_bottom = single
+
+    # Decide if the bottom is genuinely flat (wide gap between the two anchors).
+    width = max(1, int(xs.max()) - int(xs.min()))
+    flat_bottom = abs(right_bottom[0] - left_bottom[0]) > max(6, int(width * 0.03))
+
+    method = "dual-bottom" if flat_bottom else "physical-bottom"
+
+    # Virtual-bottom extrapolation is only meaningful for non-flat (pointed/chopped) tips.
+    if not flat_bottom and use_virtual_bottom_corner:
+        virtual = _virtual_bottom_point(alpha)
+        if virtual is not None:
+            left_bottom = right_bottom = virtual
             method = "virtual-bottom"
 
-    def ratio(point: tuple[int, int]) -> Optional[float]:
-        dx = point[0] - bottom[0]
+    def ratio(corner: tuple[int, int], bottom: tuple[int, int]) -> Optional[float]:
+        dx = corner[0] - bottom[0]
         if dx == 0:
             return None
-        return round((point[1] - bottom[1]) / dx, 4)
+        return round((corner[1] - bottom[1]) / dx, 4)
 
-    right_ratio = ratio(right)
-    left_ratio = ratio(left)
+    right_ratio = ratio(right, right_bottom)
+    left_ratio = ratio(left, left_bottom)
     right_abs = round(abs(right_ratio), 4) if right_ratio is not None else None
     left_abs = round(abs(left_ratio), 4) if left_ratio is not None else None
     avg_ratio = round((right_abs + left_abs) / 2, 4) if right_abs is not None and left_abs is not None else None
     side_diff = round(abs(right_abs - left_abs), 4) if right_abs is not None and left_abs is not None else None
+
+    if flat_bottom:
+        bottom_str = f"L({left_bottom[0]},{left_bottom[1]})|R({right_bottom[0]},{right_bottom[1]})"
+    else:
+        bottom_str = f"({left_bottom[0]},{left_bottom[1]})"
+
     return {
         "iso_right_ratio": right_ratio,
         "iso_left_ratio": left_ratio,
@@ -427,7 +527,7 @@ def measure_isometric_ratios(
         "iso_measurement_method": method,
         "iso_right_point": f"({right[0]},{right[1]})",
         "iso_left_point": f"({left[0]},{left[1]})",
-        "iso_bottom_point": f"({bottom[0]},{bottom[1]})",
+        "iso_bottom_point": bottom_str,
     }
 
 
@@ -545,14 +645,17 @@ def process_file(path: Path, output_dir: Path, settings: ProcessingSettings, ana
         result.original_width = img.width
         result.original_height = img.height
 
-        intermediate = remove_background(
-            img,
-            settings.background_mode,
-            settings.tolerance,
-            settings.custom_bg_hex,
-            settings.feather_edges,
-            settings.feather_radius,
-        )
+        if settings.skip_background_removal:
+            intermediate = img.convert("RGBA")
+        else:
+            intermediate = remove_background(
+                img,
+                settings.background_mode,
+                settings.tolerance,
+                settings.custom_bg_hex,
+                settings.feather_edges,
+                settings.feather_radius,
+            )
         if settings.crop_transparent:
             intermediate = crop_transparent(intermediate, settings.crop_padding)
         intermediate = scale_image(intermediate, settings.scale_x, settings.scale_y)

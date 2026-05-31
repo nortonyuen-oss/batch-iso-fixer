@@ -37,18 +37,24 @@ with st.sidebar:
 
     st.divider()
     st.header("Background")
-    settings.background_mode = st.selectbox(
-        "Background mode",
-        options=["auto_corner", "white", "custom"],
-        index=["auto_corner", "white", "custom"].index(settings.background_mode),
-        help="auto_corner 會用圖片四角估算背景色。白底圖通常用 auto_corner 或 white 都可以。",
+    settings.skip_background_removal = st.checkbox(
+        "Skip background removal",
+        value=settings.skip_background_removal,
+        help="圖片已完成去背（帶透明通道），直接跳過去背步驟，只做比例修正。",
     )
-    settings.tolerance = st.slider("Background tolerance", 0, 100, settings.tolerance)
-    if settings.background_mode == "custom":
-        settings.custom_bg_hex = st.color_picker("Custom background color", value=settings.custom_bg_hex)
-    settings.feather_edges = st.checkbox("Feather alpha edges", value=settings.feather_edges)
-    if settings.feather_edges:
-        settings.feather_radius = st.slider("Feather radius", 0.0, 3.0, float(settings.feather_radius), 0.1)
+    if not settings.skip_background_removal:
+        settings.background_mode = st.selectbox(
+            "Background mode",
+            options=["auto_corner", "white", "custom"],
+            index=["auto_corner", "white", "custom"].index(settings.background_mode),
+            help="auto_corner 會用圖片四角估算背景色。白底圖通常用 auto_corner 或 white 都可以。",
+        )
+        settings.tolerance = st.slider("Background tolerance", 0, 100, settings.tolerance)
+        if settings.background_mode == "custom":
+            settings.custom_bg_hex = st.color_picker("Custom background color", value=settings.custom_bg_hex)
+        settings.feather_edges = st.checkbox("Feather alpha edges", value=settings.feather_edges)
+        if settings.feather_edges:
+            settings.feather_radius = st.slider("Feather radius", 0.0, 3.0, float(settings.feather_radius), 0.1)
 
     st.divider()
     st.header("Crop / Scale")
@@ -140,7 +146,10 @@ else:
             c3.image(combined, caption="Before / After", use_container_width=True)
 
             if analyze_angle:
-                temp = remove_background(before, settings.background_mode, settings.tolerance, settings.custom_bg_hex, settings.feather_edges, settings.feather_radius)
+                if settings.skip_background_removal:
+                    temp = before.convert("RGBA")
+                else:
+                    temp = remove_background(before, settings.background_mode, settings.tolerance, settings.custom_bg_hex, settings.feather_edges, settings.feather_radius)
                 if settings.crop_transparent:
                     temp = crop_transparent(temp, settings.crop_padding)
                 temp = scale_image(temp, settings.scale_x, settings.scale_y)
