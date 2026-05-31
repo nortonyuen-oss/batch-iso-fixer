@@ -485,11 +485,14 @@ def measure_isometric_ratios(
 ) -> dict[str, Optional[float] | str]:
     """Measure output alpha silhouette against a 1:2 isometric y/x ratio.
 
-    Uses separate left-bottom and right-bottom anchor points so that flat-bottomed
-    isometric shapes (e.g. large sports fields) produce accurate per-side slopes.
-    For pointed-tip shapes the two anchors converge to the same point, preserving
-    the original behaviour.  Virtual-bottom extrapolation is only applied when the
-    two anchors are nearly coincident (pointed or near-pointed tips).
+    Slopes are measured from the upper silhouette outlines (equator row and above)
+    so that base decorations — fences, gardens, road surfaces, cars — cannot
+    interfere with the measurement regardless of building type.
+
+    The equator row (widest smoothed horizontal span) is found by _find_side_corners.
+    Per-row right-edge and left-edge profiles above that row are fitted with
+    _fit_lower_edge, which focuses on the lowest (wall-like) part of each profile
+    and discards roof decorations as outliers.
     """
     alpha_raw = np.array(image.convert("RGBA").getchannel("A"))
     alpha = alpha_raw > int(alpha_threshold)
@@ -509,57 +512,53 @@ def measure_isometric_ratios(
         }
 
     left, right = _find_side_corners(xs, ys)
+    # Equator y: use the lower of the two corner rows so the upper window is
+    # guaranteed to contain both corner positions.
+    equator_y = max(left[1], right[1])
 
-    # Determine per-side bottom anchors using solid-pixel filtering.
-    corners = _find_bottom_corners(alpha_raw, solid_alpha_threshold=200, y_tolerance=2)
-    if corners is not None:
-        left_bottom, right_bottom = corners
-    else:
-        single = _median_extreme_point(xs, ys, "y", int(ys.max()))
-        left_bottom = right_bottom = single
+    # Build per-row right-edge and left-edge profiles (vectorised).
+    unique_ys, inverse = np.unique(ys, return_inverse=True)
+    n_rows = len(unique_ys)
+    row_max_x = np.zeros(n_rows, dtype=np.int64)
+    row_min_x = np.full(n_rows, int(xs.max()), dtype=np.int64)
+    np.maximum.at(row_max_x, inverse, xs)
+    np.minimum.at(row_min_x, inverse, xs)
 
-    # Decide if the bottom is genuinely flat (wide gap between the two anchors).
-    width = max(1, int(xs.max()) - int(xs.min()))
-    flat_bottom = abs(right_bottom[0] - left_bottom[0]) > max(6, int(width * 0.03))
+    # Restrict to rows at or above the equator — the base-decoration-free zone.
+    upper_mask = unique_ys <= equator_y
+    upper_ys = unique_ys[upper_mask]
+    upper_max_x = row_max_x[upper_mask]
+    upper_min_x = row_min_x[upper_mask]
 
-    method = "dual-bottom" if flat_bottom else "physical-bottom"
+    # Stack into (x, y) point arrays expected by _fit_lower_edge.
+    # _fit_lower_edge takes the lower (high-y) portion of the supplied points,
+    # which corresponds to the clean wall zone just above the equator.
+    right_outline = np.stack([upper_max_x, upper_ys], axis=1).astype(np.int32)
+    left_outline = np.stack([upper_min_x, upper_ys], axis=1).astype(np.int32)
 
-    # Virtual-bottom extrapolation is only meaningful for non-flat (pointed/chopped) tips.
-    if not flat_bottom and use_virtual_bottom_corner:
-        virtual = _virtual_bottom_point(alpha)
-        if virtual is not None:
-            left_bottom = right_bottom = virtual
-            method = "virtual-bottom"
+    right_line = _fit_lower_edge(right_outline, expected_slope_sign=1)
+    left_line = _fit_lower_edge(left_outline, expected_slope_sign=-1)
 
-    def ratio(corner: tuple[int, int], bottom: tuple[int, int]) -> Optional[float]:
-        dx = corner[0] - bottom[0]
-        if dx == 0:
-            return None
-        return round((corner[1] - bottom[1]) / dx, 4)
+    right_slope = right_line[0] if right_line is not None else None
+    left_slope = left_line[0] if left_line is not None else None
 
-    right_ratio = ratio(right, right_bottom)
-    left_ratio = ratio(left, left_bottom)
-    right_abs = round(abs(right_ratio), 4) if right_ratio is not None else None
-    left_abs = round(abs(left_ratio), 4) if left_ratio is not None else None
+    right_abs = round(abs(right_slope), 4) if right_slope is not None else None
+    left_abs = round(abs(left_slope), 4) if left_slope is not None else None
     avg_ratio = round((right_abs + left_abs) / 2, 4) if right_abs is not None and left_abs is not None else None
     side_diff = round(abs(right_abs - left_abs), 4) if right_abs is not None and left_abs is not None else None
 
-    if flat_bottom:
-        bottom_str = f"L({left_bottom[0]},{left_bottom[1]})|R({right_bottom[0]},{right_bottom[1]})"
-    else:
-        bottom_str = f"({left_bottom[0]},{left_bottom[1]})"
-
+    equator_cx = (left[0] + right[0]) // 2
     return {
-        "iso_right_ratio": right_ratio,
-        "iso_left_ratio": left_ratio,
+        "iso_right_ratio": round(right_slope, 4) if right_slope is not None else None,
+        "iso_left_ratio": round(left_slope, 4) if left_slope is not None else None,
         "iso_right_abs_ratio": right_abs,
         "iso_left_abs_ratio": left_abs,
         "iso_avg_ratio": avg_ratio,
         "iso_side_diff": side_diff,
-        "iso_measurement_method": method,
+        "iso_measurement_method": "upper-edge-fit",
         "iso_right_point": f"({right[0]},{right[1]})",
         "iso_left_point": f"({left[0]},{left[1]})",
-        "iso_bottom_point": bottom_str,
+        "iso_bottom_point": f"eq({equator_cx},{equator_y})",
     }
 
 
