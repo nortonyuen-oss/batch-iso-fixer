@@ -17,9 +17,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: macOS
+          - name: macOS Apple Silicon
             os: macos-14
-            artifact: BatchIsoFixer-macOS.zip
+            artifact: BatchIsoFixer-macOS-Apple-Silicon.zip
+          - name: macOS Intel
+            os: macos-13
+            artifact: BatchIsoFixer-macOS-Intel.zip
           - name: Windows
             os: windows-latest
             artifact: BatchIsoFixer-Windows.zip

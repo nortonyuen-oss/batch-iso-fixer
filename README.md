@@ -25,7 +25,8 @@ It can:
 
 Desktop builds are published on GitHub Releases:
 
-- macOS: `BatchIsoFixer-macOS.zip`
+- macOS Apple Silicon: `BatchIsoFixer-macOS-Apple-Silicon.zip`
+- macOS Intel: `BatchIsoFixer-macOS-Intel.zip`
 - Windows: `BatchIsoFixer-Windows.zip`
 
 The packaged app starts a local Streamlit server and opens the interface in your
