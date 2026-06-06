@@ -21,6 +21,23 @@ It can:
 - optionally auto-scale each figure's Y axis to align the measured average ratio to 0.5
 - estimate a virtual bottom corner for base plates with chopped or flattened bottom corners
 
+## Download
+
+Desktop builds are published on GitHub Releases:
+
+- macOS: `BatchIsoFixer-macOS.zip`
+- Windows: `BatchIsoFixer-Windows.zip`
+
+The packaged app starts a local Streamlit server and opens the interface in your
+browser. It creates a working folder at:
+
+```text
+~/BatchIsoFixer/
+```
+
+Put source files into `~/BatchIsoFixer/input/` or
+`~/BatchIsoFixer/input/raw/`, then export to `~/BatchIsoFixer/output/`.
+
 ## Quick start
 
 ```bash
@@ -41,6 +58,25 @@ Then open the URL shown by Streamlit, usually:
 ```text
 http://localhost:8501
 ```
+
+## Desktop packaging
+
+Install PyInstaller and build the app locally:
+
+```bash
+pip install -r requirements.txt pyinstaller
+pyinstaller --clean --noconfirm build.spec
+```
+
+The GitHub release workflow builds both platforms from a version tag:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+That workflow uploads the macOS and Windows zip files to the GitHub Release.
+The website in `docs/` links to the latest release assets.
 
 ## Folder workflow
 
