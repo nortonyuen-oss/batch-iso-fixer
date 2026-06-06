@@ -16,6 +16,7 @@ except Exception:  # pragma: no cover
     cv2 = None
 
 Image.MAX_IMAGE_PIXELS = None
+RESAMPLE_LANCZOS = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
 
 BackgroundMode = Literal["white", "auto_corner", "custom"]
 AlignmentMode = Literal["center", "bottom-center"]
@@ -31,6 +32,8 @@ class ProcessingSettings:
     custom_bg_hex: str = "#ffffff"
     feather_edges: bool = True
     feather_radius: float = 0.6
+    defringe_edges: bool = True
+    edge_bleed_pixels: int = 2
     crop_transparent: bool = True
     crop_padding: int = 20
     scale_x: float = 1.0
@@ -96,6 +99,16 @@ def list_images(folder: str | Path) -> list[Path]:
     if not path.exists() or not path.is_dir():
         return []
     return sorted([p for p in path.iterdir() if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS])
+
+
+def list_images_recursive(folder: str | Path) -> list[Path]:
+    path = Path(folder).expanduser()
+    if not path.exists() or not path.is_dir():
+        return []
+    return sorted(
+        [p for p in path.rglob("*") if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS],
+        key=lambda p: p.relative_to(path).as_posix().lower(),
+    )
 
 
 def hex_to_rgb(hex_color: str) -> tuple[int, int, int]:
@@ -232,6 +245,156 @@ def remove_background(
     return result
 
 
+def settings_background_rgb(settings: ProcessingSettings, image: Image.Image) -> tuple[int, int, int]:
+    if settings.background_mode == "white":
+        return (255, 255, 255)
+    if settings.background_mode == "custom":
+        return hex_to_rgb(settings.custom_bg_hex)
+    return estimate_corner_background(image)
+
+
+def _resize_float_channel(channel: np.ndarray, size: tuple[int, int], resample: int) -> np.ndarray:
+    if cv2 is not None:
+        interpolation = cv2.INTER_LANCZOS4 if resample == RESAMPLE_LANCZOS else cv2.INTER_LINEAR
+        return cv2.resize(channel.astype(np.float32), size, interpolation=interpolation)
+    pil_channel = Image.fromarray(channel.astype(np.float32), mode="F")
+    return np.array(pil_channel.resize(size, resample=resample), dtype=np.float32)
+
+
+def alpha_aware_resize(image: Image.Image, size: tuple[int, int], resample: int = RESAMPLE_LANCZOS) -> Image.Image:
+    """Resize RGBA without letting hidden transparent RGB leak into soft edges."""
+    img = image.convert("RGBA")
+    if img.size == size:
+        return img
+
+    arr = np.array(img).astype(np.float32) / 255.0
+    alpha = arr[..., 3]
+    premultiplied = arr[..., :3] * alpha[..., None]
+
+    resized_alpha = _resize_float_channel(alpha, size, resample)
+    resized_rgb_pm = np.stack(
+        [_resize_float_channel(premultiplied[..., i], size, resample) for i in range(3)],
+        axis=-1,
+    )
+
+    out_rgb = np.zeros_like(resized_rgb_pm)
+    visible = resized_alpha > (1.0 / 255.0)
+    out_rgb[visible] = resized_rgb_pm[visible] / resized_alpha[visible, None]
+
+    out = np.zeros((*resized_alpha.shape, 4), dtype=np.uint8)
+    out[..., :3] = np.clip(out_rgb * 255.0, 0, 255).astype(np.uint8)
+    out[..., 3] = np.clip(resized_alpha * 255.0, 0, 255).astype(np.uint8)
+    return Image.fromarray(out, "RGBA")
+
+
+def _expand_rgb_from_solid(
+    rgb: np.ndarray,
+    alpha: np.ndarray,
+    radius: int,
+    solid_alpha_threshold: int = 220,
+) -> tuple[np.ndarray, np.ndarray]:
+    radius = max(0, int(radius))
+    solid = alpha >= int(solid_alpha_threshold)
+    expanded_rgb = rgb.astype(np.float32).copy()
+    known = solid.copy()
+    if radius == 0 or not np.any(known):
+        return expanded_rgb, known
+
+    kernel = np.ones((3, 3), dtype=np.uint8)
+    for _ in range(radius):
+        if cv2 is not None:
+            known_f = known.astype(np.float32)
+            count = cv2.filter2D(known_f, -1, kernel.astype(np.float32), borderType=cv2.BORDER_CONSTANT)
+            frontier = (count > 0) & ~known
+            if not np.any(frontier):
+                break
+            for channel in range(3):
+                summed = cv2.filter2D(
+                    expanded_rgb[..., channel] * known_f,
+                    -1,
+                    kernel.astype(np.float32),
+                    borderType=cv2.BORDER_CONSTANT,
+                )
+                expanded_rgb[..., channel][frontier] = summed[frontier] / count[frontier]
+        else:
+            padded_known = np.pad(known, 1, mode="constant", constant_values=False)
+            padded_rgb = np.pad(expanded_rgb, ((1, 1), (1, 1), (0, 0)), mode="edge")
+            count = np.zeros_like(alpha, dtype=np.float32)
+            summed = np.zeros_like(expanded_rgb, dtype=np.float32)
+            for dy in range(3):
+                for dx in range(3):
+                    k = padded_known[dy : dy + alpha.shape[0], dx : dx + alpha.shape[1]]
+                    count += k
+                    summed += padded_rgb[dy : dy + alpha.shape[0], dx : dx + alpha.shape[1]] * k[..., None]
+            frontier = (count > 0) & ~known
+            if not np.any(frontier):
+                break
+            expanded_rgb[frontier] = summed[frontier] / count[frontier, None]
+        known |= frontier
+    return expanded_rgb, known
+
+
+def remove_white_matte(
+    image: Image.Image,
+    background_rgb: tuple[int, int, int] = (255, 255, 255),
+    edge_radius: int = 3,
+) -> Image.Image:
+    """Pull white/color matte out of semi-transparent edge pixels."""
+    img = image.convert("RGBA")
+    arr = np.array(img)
+    alpha = arr[..., 3].astype(np.float32)
+    semi = (alpha > 0) & (alpha < 255)
+    if not np.any(semi):
+        return img
+
+    rgb = arr[..., :3].astype(np.float32)
+    bg = np.array(background_rgb, dtype=np.float32)
+    alpha_unit = np.maximum(alpha[..., None] / 255.0, 1.0 / 255.0)
+    unmatted = (rgb - bg * (1.0 - alpha_unit)) / alpha_unit
+    unmatted = np.clip(unmatted, 0, 255)
+
+    support_rgb, support_mask = _expand_rgb_from_solid(rgb, arr[..., 3], max(1, int(edge_radius)))
+    edge_supported = semi & support_mask
+    if not np.any(edge_supported):
+        return img
+
+    distance_to_bg = np.sqrt(np.sum((rgb - bg) ** 2, axis=-1))
+    low_alpha = alpha < 180
+    whiteish = distance_to_bg < 140
+    matte_pixels = edge_supported & (low_alpha | whiteish)
+
+    fixed = rgb.copy()
+    fixed[matte_pixels] = (unmatted[matte_pixels] * 0.65) + (support_rgb[matte_pixels] * 0.35)
+
+    out = arr.copy()
+    out[..., :3] = np.clip(fixed, 0, 255).astype(np.uint8)
+    return Image.fromarray(out, "RGBA")
+
+
+def bleed_transparent_rgb(
+    image: Image.Image,
+    pixels: int = 2,
+    solid_alpha_threshold: int = 32,
+) -> Image.Image:
+    """Copy visible edge colors into nearby transparent pixels for GPU sampling."""
+    pixels = max(0, int(pixels))
+    img = image.convert("RGBA")
+    if pixels == 0:
+        return img
+
+    arr = np.array(img)
+    alpha = arr[..., 3]
+    rgb = arr[..., :3]
+    expanded_rgb, support_mask = _expand_rgb_from_solid(rgb, alpha, pixels, solid_alpha_threshold)
+    target = (alpha < 255) & support_mask
+    if not np.any(target):
+        return img
+
+    out = arr.copy()
+    out[..., :3][target] = np.clip(expanded_rgb[target], 0, 255).astype(np.uint8)
+    return Image.fromarray(out, "RGBA")
+
+
 def crop_transparent(image: Image.Image, padding: int = 20) -> Image.Image:
     img = image.convert("RGBA")
     alpha = img.getchannel("A")
@@ -250,7 +413,7 @@ def scale_image(image: Image.Image, scale_x: float = 1.0, scale_y: float = 1.0) 
     img = image.convert("RGBA")
     new_w = max(1, int(round(img.width * float(scale_x))))
     new_h = max(1, int(round(img.height * float(scale_y))))
-    return img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+    return alpha_aware_resize(img, (new_w, new_h), RESAMPLE_LANCZOS)
 
 
 def fit_inside_canvas(image: Image.Image, canvas_width: int, canvas_height: int) -> Image.Image:
@@ -259,7 +422,7 @@ def fit_inside_canvas(image: Image.Image, canvas_width: int, canvas_height: int)
     ratio = min(canvas_width / image.width, canvas_height / image.height)
     new_w = max(1, int(image.width * ratio))
     new_h = max(1, int(image.height * ratio))
-    return image.resize((new_w, new_h), Image.Resampling.LANCZOS)
+    return alpha_aware_resize(image, (new_w, new_h), RESAMPLE_LANCZOS)
 
 
 def place_on_canvas(
@@ -287,6 +450,7 @@ def place_on_canvas(
 
 
 def process_image(image: Image.Image, settings: ProcessingSettings) -> Image.Image:
+    bg_rgb = settings_background_rgb(settings, image) if not settings.skip_background_removal else (255, 255, 255)
     if settings.skip_background_removal:
         out = image.convert("RGBA")
     else:
@@ -298,9 +462,13 @@ def process_image(image: Image.Image, settings: ProcessingSettings) -> Image.Ima
             feather_edges=settings.feather_edges,
             feather_radius=settings.feather_radius,
         )
+    if settings.defringe_edges:
+        out = remove_white_matte(out, bg_rgb, edge_radius=max(2, int(settings.edge_bleed_pixels) + 1))
+    out = bleed_transparent_rgb(out, settings.edge_bleed_pixels)
     if settings.crop_transparent:
         out = crop_transparent(out, settings.crop_padding)
     out = scale_image(out, settings.scale_x, settings.scale_y)
+    out = bleed_transparent_rgb(out, settings.edge_bleed_pixels)
     if settings.align_to_isometric:
         out, _, _, _ = apply_isometric_alignment(
             out,
@@ -308,6 +476,7 @@ def process_image(image: Image.Image, settings: ProcessingSettings) -> Image.Ima
             settings.iso_max_side_diff,
             settings.iso_use_virtual_bottom_corner,
         )
+        out = bleed_transparent_rgb(out, settings.edge_bleed_pixels)
     out = place_on_canvas(
         out,
         settings.canvas_width,
@@ -316,6 +485,7 @@ def process_image(image: Image.Image, settings: ProcessingSettings) -> Image.Ima
         settings.bottom_margin,
         settings.preserve_if_too_large,
     )
+    out = bleed_transparent_rgb(out, settings.edge_bleed_pixels)
     return out
 
 
@@ -599,7 +769,7 @@ def make_before_after(before: Image.Image, after: Image.Image, checker: bool = T
 
     def resize_keep(img: Image.Image) -> Image.Image:
         ratio = target_h / img.height
-        return img.resize((max(1, int(img.width * ratio)), target_h), Image.Resampling.LANCZOS)
+        return alpha_aware_resize(img, (max(1, int(img.width * ratio)), target_h), RESAMPLE_LANCZOS)
 
     b = resize_keep(before)
     a = resize_keep(after)
@@ -670,12 +840,24 @@ def detect_base_angle(image: Image.Image) -> tuple[Optional[float], Optional[flo
     return round(current, 2), round(suggested_scale_y, 4)
 
 
-def process_file(path: Path, output_dir: Path, settings: ProcessingSettings, analyze_angle: bool = False) -> ProcessResult:
-    result = ProcessResult(filename=path.name, status="failed", scale_x=settings.scale_x, scale_y=settings.scale_y)
+def process_file(
+    path: Path,
+    output_dir: Path,
+    settings: ProcessingSettings,
+    analyze_angle: bool = False,
+    relative_to: Optional[Path] = None,
+    preserve_tree: bool = False,
+) -> ProcessResult:
+    if preserve_tree and relative_to is not None:
+        display_name = path.relative_to(relative_to).as_posix()
+    else:
+        display_name = path.name
+    result = ProcessResult(filename=display_name, status="failed", scale_x=settings.scale_x, scale_y=settings.scale_y)
     try:
         img = load_image(path)
         result.original_width = img.width
         result.original_height = img.height
+        bg_rgb = settings_background_rgb(settings, img) if not settings.skip_background_removal else (255, 255, 255)
 
         if settings.skip_background_removal:
             intermediate = img.convert("RGBA")
@@ -688,9 +870,17 @@ def process_file(path: Path, output_dir: Path, settings: ProcessingSettings, ana
                 settings.feather_edges,
                 settings.feather_radius,
             )
+        if settings.defringe_edges:
+            intermediate = remove_white_matte(
+                intermediate,
+                bg_rgb,
+                edge_radius=max(2, int(settings.edge_bleed_pixels) + 1),
+            )
+        intermediate = bleed_transparent_rgb(intermediate, settings.edge_bleed_pixels)
         if settings.crop_transparent:
             intermediate = crop_transparent(intermediate, settings.crop_padding)
         intermediate = scale_image(intermediate, settings.scale_x, settings.scale_y)
+        intermediate = bleed_transparent_rgb(intermediate, settings.edge_bleed_pixels)
 
         if settings.align_to_isometric:
             intermediate, pre_measurements, factor, reason = apply_isometric_alignment(
@@ -708,6 +898,7 @@ def process_file(path: Path, output_dir: Path, settings: ProcessingSettings, ana
             else:
                 result.iso_auto_scale_applied = True
                 result.iso_auto_scale_y = factor
+            intermediate = bleed_transparent_rgb(intermediate, settings.edge_bleed_pixels)
 
         result.processed_width = intermediate.width
         result.processed_height = intermediate.height
@@ -725,6 +916,7 @@ def process_file(path: Path, output_dir: Path, settings: ProcessingSettings, ana
             settings.bottom_margin,
             settings.preserve_if_too_large,
         )
+        final = bleed_transparent_rgb(final, settings.edge_bleed_pixels)
         iso_measurements = measure_isometric_ratios(
             final,
             use_virtual_bottom_corner=settings.iso_use_virtual_bottom_corner,
@@ -739,8 +931,12 @@ def process_file(path: Path, output_dir: Path, settings: ProcessingSettings, ana
         result.iso_right_point = str(iso_measurements["iso_right_point"])
         result.iso_left_point = str(iso_measurements["iso_left_point"])
         result.iso_bottom_point = str(iso_measurements["iso_bottom_point"])
-        output_dir.mkdir(parents=True, exist_ok=True)
-        out_path = output_dir / f"{path.stem}_fixed.png"
+        if preserve_tree and relative_to is not None:
+            rel_path = path.relative_to(relative_to)
+            out_path = (output_dir / rel_path).with_suffix(".png")
+        else:
+            out_path = output_dir / f"{path.stem}_fixed.png"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
         final.save(out_path)
         result.final_width = final.width
         result.final_height = final.height
@@ -761,6 +957,31 @@ def process_batch(
     paths = list_images(input_dir)
     out_dir = Path(output_dir).expanduser()
     results = [process_file(p, out_dir, settings, analyze_angle=analyze_angle) for p in paths]
+    write_log(results, out_dir / "process_log.csv")
+    (out_dir / "settings.json").write_text(settings.to_json(), encoding="utf-8")
+    return results
+
+
+def process_recursive_batch(
+    input_dir: str | Path,
+    output_dir: str | Path,
+    settings: ProcessingSettings,
+    analyze_angle: bool = False,
+) -> list[ProcessResult]:
+    in_dir = Path(input_dir).expanduser()
+    out_dir = Path(output_dir).expanduser()
+    paths = list_images_recursive(in_dir)
+    results = [
+        process_file(
+            p,
+            out_dir,
+            settings,
+            analyze_angle=analyze_angle,
+            relative_to=in_dir,
+            preserve_tree=True,
+        )
+        for p in paths
+    ]
     write_log(results, out_dir / "process_log.csv")
     (out_dir / "settings.json").write_text(settings.to_json(), encoding="utf-8")
     return results
